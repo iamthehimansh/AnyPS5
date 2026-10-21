@@ -3964,7 +3964,7 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
         std::vector<Graphics::CompiledShader> stages{{Stage::Compute, shaders[0].program, shaders[0].pushConstantOffset}, {Stage::Vertex, &synthesized[0], 0}};
         if (shaders[1].program->barycentricEmulation.active) {
             require(target.tessellation.has_value(), "an emulated mesh draw whose pixel shader reads barycentrics needs tessellation");
-            auto patches = ShaderRecompiler::BuildBarycentricTessellationShaders(synthesized[0], *shaders[1].program, target, MaxFragmentInputComponents());
+            auto patches = ShaderRecompiler::BuildBarycentricTessellationShaders(synthesized[0], *shaders[1].program, target, MaxFragmentInputComponents(), graphics.provokingVertexMode == VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT ? 2u : 0u);
             synthesized.push_back(std::move(patches.control));
             synthesized.push_back(std::move(patches.evaluation));
             stages.push_back({Stage::TessellationControl, &synthesized[1], 0});
