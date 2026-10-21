@@ -293,6 +293,9 @@ struct SpirvTarget {
     bool robustBufferAccess2 = false;
     bool depthRangeRemap = false;
     bool float32FlushToZero = false;
+#ifdef __APPLE__
+    bool meshEmulated = false;
+#endif
 };
 
 struct BindingLayout {
@@ -360,6 +363,13 @@ inline constexpr std::uint32_t MeshIndexRestartTable = 0x100;
 inline constexpr std::uint32_t MeshRestartLengthDword = MeshArgumentBytes / 4;
 inline constexpr std::uint32_t MeshRestartTableDword = MeshRestartLengthDword + 1;
 inline constexpr std::uint32_t MeshIndexBufferUserWord = 4;
+#ifdef __APPLE__
+// An emulated mesh stage (a compute shader on a device without VK_EXT_mesh_shader) takes its vertex-record and
+// triangle-index buffer addresses in four push words after the 32-word slot.
+inline constexpr std::uint32_t MeshEmulationVertexAddressDword = 32;
+inline constexpr std::uint32_t MeshEmulationIndexAddressDword = 34;
+inline constexpr std::uint32_t MeshEmulationPushDwords = 36;
+#endif
 inline constexpr std::uint32_t WorkgroupMemoryDescriptorSet = 1;
 
 struct GraphicsDrawParameters {
@@ -786,6 +796,12 @@ struct BarycentricTessellationShaders {
 
 [[nodiscard]] BarycentricTessellationShaders BuildBarycentricTessellationShaders(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, std::uint32_t maxFragmentInputComponents);
 
+#ifdef __APPLE__
+// The vertex half of a mesh stage emulated as compute: vertex input 0 is the position and inputs 1.. are the mesh
+// program's parameter exports in ascending location order, one vec4 each, as the compute half writes its records.
+[[nodiscard]] RecompileResult BuildMeshEmulationVertexShader(const RecompileResult& mesh, const SpirvTarget& target);
+
+#endif
 }
 
 #endif

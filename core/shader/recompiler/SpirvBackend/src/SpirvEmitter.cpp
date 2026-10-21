@@ -274,6 +274,9 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.barycentricPositionsLocation = target.barycentricPositionsLocation;
     state.meshExportedLocations = target.meshExportedLocations;
     state.meshPerVertexLocations = target.meshPerVertexLocations;
+#ifdef __APPLE__
+    state.meshEmulated = target.meshEmulated;
+#endif
     state.float16DenormPreserve = target.float16DenormPreserve;
     state.robustBufferAccess2 = target.robustBufferAccess2;
     state.float32FlushToZero = target.float32FlushToZero;
@@ -315,7 +318,12 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.bdaStopsInvocations = state.waveLdsScope == 0 && !state.spannedWave && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
     EmitModuleHeader(state, bindings);
     EmitProgram(state);
+#ifdef __APPLE__
+    const auto model = state.meshEmulated ? static_cast<std::uint32_t>(spv::ExecutionModelGLCompute) : ExecutionModelForStage(state.program.Resources().stage);
+    state.module.EmitEntryPoint(model, state.mainFunc, "main", state.interfaceVariables);
+#else
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);
+#endif
     if (info != nullptr) info->fullSubgroups = state.spannedWave;
     return state.module.Finalize();
 }

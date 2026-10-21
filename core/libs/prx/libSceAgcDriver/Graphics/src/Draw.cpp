@@ -7,6 +7,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#ifdef __APPLE__
+#include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
+#endif
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -1771,12 +1774,21 @@ void recordStencilReplay(const Context& context, VkCommandBuffer commands, const
     }
 }
 
+#ifdef __APPLE__
+// The vertex-record and triangle-index addresses of the emulated mesh draw being recorded on this thread; the
+// passthrough vertex shader reads them from the first 16 bytes of the vertex push slot.
+thread_local std::optional<std::array<VkDeviceAddress, 2>> emulatedMeshBuffers;
+
+#endif
 void pushDrawConstants(const Pipeline& pipeline, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const ShaderResources& resources, const std::array<std::byte, PipelinePushConstantBytes>* bytes, VkShaderStageFlags stages, VkDeviceAddress meshArguments = 0, bool restartTable = false) {
     auto block = bytes != nullptr ? *bytes : AssemblePushConstants(shaders);
     if (bytes == nullptr) {
         resources.PatchPushConstants(block);
         stages = PushConstantStages(shaders);
     }
+#ifdef __APPLE__
+    if (emulatedMeshBuffers) std::memcpy(block.data(), emulatedMeshBuffers->data(), sizeof(*emulatedMeshBuffers));
+#endif
     patchDepthRemapPush(block, state);
     if (state.stages.tessellation) {
         for (const auto& shader : shaders) Require(shader.program->pushConstants.empty() || shader.pushConstantOffset >= PipelinePushSlotBytes || shader.pushConstantOffset + shader.program->pushConstants.size() <= ShaderRecompiler::TessellationLevelPushOffsetBytes, "a stage's push constants overlap the tessellation levels");
@@ -2119,7 +2131,170 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     return std::nullopt;
 }
 
+#ifdef __APPLE__
+namespace {
+
+// Runs the mesh program of an emulated mesh draw (compiled as a compute shader) once, writing a vertex record and three
+// triangle indices per mesh output, then draws them as a plain triangle list with the passthrough vertex shader.
+void DrawEmulatedMesh(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
+    using ShaderRecompiler::ShaderStage;
+    Require(state.stages.mesh.has_value() && shaders.front().stage == ShaderStage::Compute, "an emulated mesh draw starts with its mesh program as a compute stage");
+    const auto& mesh = *state.stages.mesh;
+    const auto& compute = shaders.front();
+    Require(compute.program->pushConstants.size() <= PipelinePushSlotBytes, "an emulated mesh program's push constants exceed one slot");
+    Require(((state.stages.registerValue >> 19u) & 3u) == 0 || !draw.indexed, "indexed fast-launch draws are unsupported");
+    // The mesh program reads its index range from the argument buffer: a direct draw passes the whole index count,
+    // an indirect draw the record the guest wrote before submitting, resolved as the hardware path resolves it.
+    MeshArguments resolved{0u, 0u, 0u, draw.indexCount, 0u};
+    std::uint32_t groupCount = 0;
+    std::uint32_t instances = 0;
+    std::uint32_t firstVertex = draw.firstVertex;
+    if (draw.indirect) {
+        const auto& indirect = *draw.indirect;
+        Require(!indirect.countIndirect && indirect.count == 1u && indirect.recordBytes >= 12u, "an emulated indirect mesh draw has one record");
+        std::array<std::uint32_t, 5> words{};
+        std::memcpy(words.data(), reinterpret_cast<const void*>(indirect.arguments), std::min<std::size_t>(indirect.recordBytes, sizeof(words)));
+        auto rules = MeshArgumentRulesFor(context, mesh, draw.indexCount);
+        rules.maxGroups = context.limits.maxComputeWorkGroupCount[0];
+        rules.maxInstances = context.limits.maxComputeWorkGroupCount[1];
+        rules.maxTotal = std::numeric_limits<std::uint32_t>::max();
+        resolved = ResolveMeshArguments(Pm4::DrawArguments{words[0], words[1], words[2], 0u, 0u}, rules);
+        groupCount = resolved.groups;
+        instances = resolved.instances;
+        firstVertex = indirect.vertexConstant;
+    } else {
+        Require(draw.firstInstance == 0, "an emulated mesh draw starts at instance 0");
+        const auto inputSize = mesh.inputPrimitive == 1 ? 1u : mesh.inputPrimitive == 2 ? 2u : 3u;
+        Require(mesh.primitivesPerGroup != 0, "mesh pipeline groups no primitive (zero primitives per group)");
+        if (draw.indexCount >= inputSize && draw.instanceCount != 0) {
+            const auto step = mesh.inputPrimitive == 5 || mesh.inputPrimitive == 6 ? 1u : inputSize;
+            groupCount = ((draw.indexCount - inputSize) / step) / mesh.primitivesPerGroup + 1u;
+            instances = draw.instanceCount;
+        }
+    }
+    if (groupCount == 0 || instances == 0) return;
+    const std::uint64_t totalGroups = static_cast<std::uint64_t>(groupCount) * instances;
+    const auto recordBytes = static_cast<std::uint64_t>(shaders[1].program->parameterExports.size() + 1u) * 16u;
+    const auto vertices = totalGroups * mesh.maxVertices;
+    Require(mesh.outputPrimitiveSize == 2u || mesh.outputPrimitiveSize == 3u, "an emulated mesh draw writes lines or triangles");
+    const std::uint64_t corners = mesh.outputPrimitiveSize;
+    const auto triangles = totalGroups * mesh.maxPrimitives;
+    Require(triangles * corners <= std::numeric_limits<std::uint32_t>::max(), "an emulated mesh draw writes too many primitives");
+    constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    auto records = std::make_shared<Buffer>(context, static_cast<std::size_t>(vertices * recordBytes), usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    auto indices = std::make_shared<Buffer>(context, static_cast<std::size_t>(triangles * corners * 4u), usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    if (draw.indexed && state.primitiveRestart && mesh.inputPrimitive == 5 && draw.indexAddress != 0) {
+        const auto restart = draw.indexSize == 2 ? 0xffffu : 0xffffffffu;
+        for (std::uint32_t i = 0; i < draw.indexCount; ++i) {
+            std::uint32_t value = 0;
+            std::memcpy(&value, reinterpret_cast<const std::byte*>(draw.indexAddress) + static_cast<std::size_t>(i) * draw.indexSize, draw.indexSize);
+            Require(value != restart, "primitive restart in a triangle fan geometry draw is unsupported");
+        }
+    }
+    std::vector<std::uint32_t> restartTable;
+    if (draw.indexed && state.primitiveRestart && mesh.inputPrimitive == 6 && draw.indexAddress != 0 && draw.indexCount != 0) {
+        restartTable = MeshRestartTable(std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(draw.indexCount) * draw.indexSize), draw.indexSize);
+    }
+    auto arguments = directMeshArguments(context, draw, restartTable);
+    std::memcpy(arguments->Bytes().data(), &resolved, sizeof(resolved));
+    ShaderResources resources(context, compute, snapshots, false);
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkShaderModule module = VK_NULL_HANDLE;
+    const auto destroy = context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout");
+    const auto destroyPipeline = context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline");
+    const auto destroyModule = context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule");
+    const auto release = [&] {
+        if (pipeline != VK_NULL_HANDLE) destroyPipeline(context.device, pipeline, nullptr);
+        if (layout != VK_NULL_HANDLE) destroy(context.device, layout, nullptr);
+        if (module != VK_NULL_HANDLE) destroyModule(context.device, module, nullptr);
+    };
+    try {
+        const auto sets = resources.SetLayouts();
+        std::vector<VkDescriptorSetLayout> setLayouts{sets.main};
+        if (sets.split) setLayouts.push_back(sets.fragment);
+        const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, ShaderRecompiler::MeshEmulationPushDwords * 4u};
+        VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        layoutInfo.setLayoutCount = static_cast<std::uint32_t>(setLayouts.size());
+        layoutInfo.pSetLayouts = setLayouts.data();
+        layoutInfo.pushConstantRangeCount = 1;
+        layoutInfo.pPushConstantRanges = &push;
+        Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout emulated mesh");
+        module = CreateShaderModule(context, compute.program->spirv.data(), compute.program->spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule emulated mesh");
+        const PipelineSpecialization specialization(*compute.program);
+        VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+        pipelineInfo.stage.module = module;
+        pipelineInfo.stage.pName = "main";
+        pipelineInfo.stage.pSpecializationInfo = specialization.Info();
+        pipelineInfo.layout = layout;
+        Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateComputePipelines emulated mesh");
+        std::array<std::byte, ShaderRecompiler::MeshEmulationPushDwords * 4u> block{};
+        const auto assembled = AssemblePushConstants(std::span(&compute, 1));
+        std::memcpy(block.data(), assembled.data(), PipelinePushSlotBytes);
+        const std::array<std::uint32_t, ShaderRecompiler::MeshDrawPushBytes / 4> words{draw.indexCount, firstVertex, 0u, draw.indexed ? draw.indexSize | (restartTable.empty() ? 0u : ShaderRecompiler::MeshIndexRestartTable) : 0u, static_cast<std::uint32_t>(arguments->DeviceAddress()), static_cast<std::uint32_t>(arguments->DeviceAddress() >> 32u)};
+        std::memcpy(block.data() + ShaderRecompiler::MeshDrawPushOffsetBytes, words.data(), sizeof(words));
+        const std::array<VkDeviceAddress, 2> addresses{records->DeviceAddress(), indices->DeviceAddress()};
+        std::memcpy(block.data() + ShaderRecompiler::MeshEmulationVertexAddressDword * 4u, addresses.data(), sizeof(addresses));
+        CommandBatch batch(context);
+        const auto commands = batch.Handle();
+        context.Resolved(&DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, indices->Handle(), 0, VK_WHOLE_SIZE, 0u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT);
+        context.Resolved(&DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, layout);
+        context.Function<PFN_vkCmdPushConstants>("vkCmdPushConstants")(commands, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, static_cast<std::uint32_t>(block.size()), block.data());
+        context.Resolved(&DeviceFunctions::cmdDispatch, "vkCmdDispatch")(commands, groupCount, instances, 1u);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+        batch.SubmitAndWait();
+    } catch (...) {
+        release();
+        throw;
+    }
+    release();
+    State flat = state;
+    flat.stages.mesh.reset();
+    flat.stages.path = ShaderPath::Vertex;
+    flat.topology = corners == 2u ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    flat.primitiveRestart = false;
+    Pm4::DrawParameters list = draw;
+    list.indexed = false;
+    list.indirect.reset();
+    list.indexAddress = 0;
+    list.indexSize = 0;
+    list.indexCount = static_cast<std::uint32_t>(triangles * corners);
+    list.instanceCount = 1;
+    list.firstVertex = 0;
+    list.firstInstance = 0;
+    emulatedMeshBuffers = std::array<VkDeviceAddress, 2>{records->DeviceAddress(), indices->DeviceAddress()};
+    try {
+        Draw(context, flat, list, shaders.subspan(1), snapshots, nullptr);
+    } catch (...) {
+        emulatedMeshBuffers.reset();
+        throw;
+    }
+    emulatedMeshBuffers.reset();
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+        recorder->Keep(records);
+        recorder->Keep(indices);
+        recorder->Keep(arguments);
+    }
+}
+
+}
+
+bool RecordingEmulatedMeshDraw() {
+    return emulatedMeshBuffers.has_value();
+}
+
+#endif
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {
+#ifdef __APPLE__
+    if (!shaders.empty() && shaders.front().stage == ShaderRecompiler::ShaderStage::Compute) {
+        DrawEmulatedMesh(context, state, draw, shaders, snapshots);
+        return;
+    }
+#endif
     std::vector<std::uint32_t> stencilReferences;
     for (const auto& shader : shaders) {
         if (shader.program != nullptr && !shader.program->stencilReferences.empty()) {

@@ -466,6 +466,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowRectList);
     };
     if (graphics.rectList) buildRectList();
+#ifdef __APPLE__
+    // An emulated mesh draw (no VK_EXT_mesh_shader) gets its passthrough vertex shader and any barycentric patches in
+    // VulkanDevice::Draw, so the mesh-path barycentric emulation below is not used for it.
+    if (localDevice->Target().meshEmulated && graphics.stages.path == Graphics::ShaderPath::Geometry) {
+    } else
+#endif
     if (!programs.empty() && programResults.back() != nullptr && programResults.back()->barycentricEmulation.active && graphics.stages.path == Graphics::ShaderPath::Geometry) {
         require(localDevice->Target().mesh.has_value(), "a pixel shader on the mesh path reads barycentrics, and this device has neither VK_KHR_fragment_shader_barycentric nor mesh shaders (VK_EXT_mesh_shader), so they cannot be provided or emulated");
         require(!graphics.rectList && graphics.stages.mesh && programs.size() == 2 && programResults[0] != nullptr && programResults[1] != nullptr && stages.size() == 2, "a pixel shader that reads barycentrics needs exactly one mesh program before it to emulate them");

@@ -125,6 +125,9 @@ struct SpirvEmitterState {
     std::uint32_t meshClipLinear = 0;
     std::uint32_t meshFlatPositions = 0;
     std::uint32_t pixelFlatPositions = 0;
+#ifdef __APPLE__
+    bool meshEmulated = false;
+#endif
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> solvedBarycentrics;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;

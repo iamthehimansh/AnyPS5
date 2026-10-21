@@ -238,11 +238,17 @@ void DefineModule(SpirvEmitterState& state) {
     if (StageOf(state) == IrShaderStage::Mesh) {
         const auto& mesh = VertexInfo(state).mesh;
         state.meshGuestFunc = state.module.AllocateId();
+#ifdef __APPLE__
+        if (!state.meshEmulated) {
+#endif
         state.module.EmitCapability(spv::CapabilityMeshShadingEXT);
         state.module.EmitExtension("SPV_EXT_mesh_shader");
         state.module.AddExecutionMode(state.mainFunc, mesh.outputPrimitiveSize == 2u ? spv::ExecutionModeOutputLinesEXT : spv::ExecutionModeOutputTrianglesEXT);
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeOutputVertices, mesh.maxVertices);
         state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeOutputPrimitivesEXT, mesh.maxPrimitives);
+#ifdef __APPLE__
+        }
+#endif
     }
     if (StageOf(state) == IrShaderStage::TessellationControl || StageOf(state) == IrShaderStage::TessellationEvaluation) {
         DefineTessellationExecutionModes(state);

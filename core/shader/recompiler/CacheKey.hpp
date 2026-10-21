@@ -292,6 +292,9 @@ private:
         append(key, value.spannedWaves);
         append(key, value.robustBufferAccess2);
         append(key, value.float32FlushToZero);
+#ifdef __APPLE__
+        append(key, value.meshEmulated);
+#endif
     }
 };
 

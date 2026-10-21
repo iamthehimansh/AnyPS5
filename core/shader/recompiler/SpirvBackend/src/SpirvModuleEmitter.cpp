@@ -904,10 +904,164 @@ void DefineTessellationExecutionModes(SpirvEmitterState& state) {
     }
 }
 
+#ifdef __APPLE__
+// An emulated mesh stage keeps only the per-lane staging of each export; EmitEmulatedMeshEntryPoint writes it to a
+// vertex-record buffer instead of mesh outputs, so no Output variables or mesh built-ins are declared.
+static void DefineEmulatedMeshOutputs(SpirvEmitterState& state) {
+    const auto& mesh = state.inputInfo.vertex->mesh;
+    if (state.meshBarycentricVertex) {
+        throw std::runtime_error("an emulated mesh stage takes barycentrics from the vertex-path fallback, not from mesh outputs");
+    }
+    if (mesh.outputPrimitiveSize != 2u && mesh.outputPrimitiveSize != 3u) {
+        throw std::runtime_error("an emulated mesh stage only writes lines and triangles");
+    }
+    for (auto& output : state.outputs) {
+        if (output.kind != StageOutputKind::Position && output.kind != StageOutputKind::Parameter) {
+            throw std::runtime_error("an emulated mesh stage only carries the position and parameters");
+        }
+        output.meshDataVariable = MeshArray(state, spv::StorageClassPrivate, MeshOutputType(state, output.kind), state.laneCount);
+    }
+    state.meshAllocation = MeshArray(state, spv::StorageClassWorkgroup, TypeU32(state), 2u);
+    state.meshPrimitiveData = MeshArray(state, spv::StorageClassPrivate, TypeU32(state), state.laneCount);
+    if (state.numWorkgroupsVariable == 0u) {
+        state.numWorkgroupsVariable = DefineInterfaceVariable(state, TypeU32Vector(state, 3u), spv::StorageClassInput, "gl_NumWorkGroups");
+        state.module.AddAnnotation(spv::OpDecorate, state.numWorkgroupsVariable, spv::DecorationBuiltIn, spv::BuiltInNumWorkgroups);
+    }
+}
+
+// The position, then every parameter in ascending location order, one vec4 each; the driver lays the passthrough
+// vertex shader's attributes out the same way from the result's parameterExports.
+static std::vector<const SpirvOutputBinding*> EmulatedMeshRecord(const SpirvEmitterState& state) {
+    // A program that never exports a position keeps the slot; its vertices are written at the origin.
+    std::vector<const SpirvOutputBinding*> record{nullptr};
+    for (const auto& output : state.outputs) {
+        if (output.kind == StageOutputKind::Position) record.front() = &output;
+    }
+    std::vector<const SpirvOutputBinding*> parameters;
+    for (const auto& output : state.outputs) {
+        if (output.kind == StageOutputKind::Parameter) parameters.push_back(&output);
+    }
+    std::ranges::sort(parameters, {}, [](const SpirvOutputBinding* output) { return output->location; });
+    record.insert(record.end(), parameters.begin(), parameters.end());
+    return record;
+}
+
+static void EmitEmulatedMeshEntryPoint(SpirvEmitterState& state) {
+    state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
+    EmitLabel(state, state.module.AllocateId());
+    for (std::uint32_t half = 0; half < state.laneCount; half++) {
+        state.module.AddFunction(spv::OpStore, MeshElement(state, state.meshPrimitiveData, spv::StorageClassPrivate, TypeU32(state), ConstantU32(state, half)), ConstantU32(state, 0x80000000u));
+    }
+    const auto firstInvocation = state.module.AllocateId();
+    state.laneHalf = 0;
+    state.module.AddFunction(spv::OpIEqual, TypeBool(state), firstInvocation, EmitLocalInvocationIndex(state), ConstantU32(state, 0u));
+    EmitIfCondition(state, firstInvocation, [&]() {
+        for (std::uint32_t field = 0; field < 2u; field++) {
+            state.module.AddFunction(spv::OpStore, MeshElement(state, state.meshAllocation, spv::StorageClassWorkgroup, TypeU32(state), ConstantU32(state, field)), ConstantU32(state, 0u));
+        }
+    });
+    state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.meshGuestFunc);
+    state.module.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsWorkgroupMemoryMask));
+    const auto& mesh = state.inputInfo.vertex->mesh;
+    const auto u64 = TypeScalarU64(state);
+    const auto component = [&](std::uint32_t variable, std::uint32_t index) {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeU32(state)), pointer, variable, ConstantU32(state, index));
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+        return value;
+    };
+    const auto pushAddress = [&](std::uint32_t dword) {
+        const auto word = [&](std::uint32_t index) {
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypePushConstantElementPointer(state), pointer, state.pushConstantVariable, ConstantU32(state, 0u), ConstantU32(state, index));
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+            return Unary(state, spv::OpUConvert, u64, value);
+        };
+        return Binary(state, spv::OpBitwiseOr, u64, word(dword), Binary(state, spv::OpShiftLeftLogical, u64, word(dword + 1u), ConstantU32(state, 32u)));
+    };
+    const auto clamp = [&](std::uint32_t value, std::uint32_t limit) {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpExtInst, TypeU32(state), result, GlslStd450(state), GLSLstd450UMin, value, ConstantU32(state, limit));
+        return result;
+    };
+    const auto groupsX = component(state.numWorkgroupsVariable, 0u);
+    const auto noGroups = state.module.AllocateId();
+    state.module.AddFunction(spv::OpIEqual, TypeBool(state), noGroups, groupsX, ConstantU32(state, 0u));
+    const auto allocatedVertices = clamp(MeshLoad(state, state.meshAllocation, spv::StorageClassWorkgroup, TypeU32(state), ConstantU32(state, 0u)), mesh.maxVertices);
+    const auto vertices = state.module.AllocateId();
+    state.module.AddFunction(spv::OpSelect, TypeU32(state), vertices, noGroups, ConstantU32(state, 0u), allocatedVertices);
+    const auto primitives = clamp(MeshLoad(state, state.meshAllocation, spv::StorageClassWorkgroup, TypeU32(state), ConstantU32(state, 1u)), mesh.maxPrimitives);
+    const auto anyVertex = state.module.AllocateId();
+    state.module.AddFunction(spv::OpExtInst, TypeU32(state), anyVertex, GlslStd450(state), GLSLstd450UMax, vertices, ConstantU32(state, 1u));
+    const auto lastVertex = EmitBinaryU32(state, spv::OpISub, anyVertex, ConstantU32(state, 1u));
+    const auto groupsY = component(state.numWorkgroupsVariable, 1u);
+    const auto workgroup = [&](std::uint32_t index) { return EmitInputComponentU32(state, StageInputKind::WorkgroupId, index); };
+    const auto group = EmitBinaryU32(state, spv::OpIAdd, workgroup(0u), EmitBinaryU32(state, spv::OpIMul, groupsX, EmitBinaryU32(state, spv::OpIAdd, workgroup(1u), EmitBinaryU32(state, spv::OpIMul, groupsY, workgroup(2u)))));
+    const auto record = EmulatedMeshRecord(state);
+    const auto recordBytes = static_cast<std::uint32_t>(record.size()) * 16u;
+    const auto firstVertex = EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, mesh.maxVertices));
+    const auto vertexAddress = pushAddress(MeshEmulationVertexAddressDword);
+    const auto indexAddress = pushAddress(MeshEmulationIndexAddressDword);
+    const auto vec4Pointer = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeF32Vector(state, 4u));
+    const auto u32Pointer = TypePointer(state, spv::StorageClassPhysicalStorageBuffer, TypeU32(state));
+    const auto at = [&](std::uint32_t base, std::uint32_t element, std::uint32_t elementBytes, std::uint32_t offsetBytes) {
+        const auto scaled = Binary(state, spv::OpIMul, u64, Unary(state, spv::OpUConvert, u64, element), BdaConstant(state, elementBytes));
+        return Binary(state, spv::OpIAdd, u64, base, Binary(state, spv::OpIAdd, u64, scaled, BdaConstant(state, offsetBytes)));
+    };
+    const auto store = [&](std::uint32_t pointerType, std::uint32_t address, std::uint32_t value, std::uint32_t alignment) {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, pointerType, pointer, address);
+        state.module.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask, alignment);
+    };
+    for (std::uint32_t half = 0; half < state.laneCount; half++) {
+        state.laneHalf = half;
+        const auto index = EmitLocalInvocationIndex(state);
+        const auto isVertex = state.module.AllocateId();
+        state.module.AddFunction(spv::OpULessThan, TypeBool(state), isVertex, index, vertices);
+        EmitIfCondition(state, isVertex, [&]() {
+            const auto vertex = EmitBinaryU32(state, spv::OpIAdd, firstVertex, index);
+            for (std::uint32_t slot = 0; slot < record.size(); slot++) {
+                const auto value = record[slot] != nullptr ? MeshLoad(state, record[slot]->meshDataVariable, spv::StorageClassPrivate, TypeF32Vector(state, 4u), ConstantU32(state, half)) : state.module.Constant(spv::OpConstantNull, TypeF32Vector(state, 4u));
+                store(vec4Pointer, at(vertexAddress, vertex, recordBytes, slot * 16u), value, 16u);
+            }
+        });
+        const auto isPrimitive = state.module.AllocateId();
+        state.module.AddFunction(spv::OpULessThan, TypeBool(state), isPrimitive, index, primitives);
+        EmitIfCondition(state, isPrimitive, [&]() {
+            const auto packed = MeshLoad(state, state.meshPrimitiveData, spv::StorageClassPrivate, TypeU32(state), ConstantU32(state, half));
+            const auto culled = state.module.AllocateId();
+            state.module.AddFunction(spv::OpINotEqual, TypeBool(state), culled, EmitBinaryU32(state, spv::OpBitwiseAnd, packed, ConstantU32(state, 0x80000000u)), ConstantU32(state, 0u));
+            const auto primitive = EmitBinaryU32(state, spv::OpIAdd, EmitBinaryU32(state, spv::OpIMul, group, ConstantU32(state, mesh.maxPrimitives)), index);
+            const auto corners = mesh.outputPrimitiveSize;
+            for (std::uint32_t corner = 0; corner < corners; corner++) {
+                const auto field = state.module.AllocateId();
+                state.module.AddFunction(spv::OpBitFieldUExtract, TypeU32(state), field, packed, ConstantU32(state, corner * 10u), ConstantU32(state, 9u));
+                const auto vertex = state.module.AllocateId();
+                state.module.AddFunction(spv::OpExtInst, TypeU32(state), vertex, GlslStd450(state), GLSLstd450UMin, field, lastVertex);
+                const auto global = state.module.AllocateId();
+                state.module.AddFunction(spv::OpSelect, TypeU32(state), global, culled, ConstantU32(state, 0u), EmitBinaryU32(state, spv::OpIAdd, firstVertex, vertex));
+                store(u32Pointer, at(indexAddress, primitive, corners * 4u, corner * 4u), global, 4u);
+            }
+        });
+    }
+    state.laneHalf = 0;
+    state.module.AddFunction(spv::OpReturn);
+    state.module.AddFunction(spv::OpFunctionEnd);
+}
+
+#endif
 void DefineMeshOutputs(SpirvEmitterState& state) {
     if (state.inputInfo.vertex == nullptr) {
         throw std::runtime_error("vertex input info is missing for mesh output definition");
     }
+#ifdef __APPLE__
+    if (state.meshEmulated) {
+        DefineEmulatedMeshOutputs(state);
+        return;
+    }
+#endif
     const auto& mesh = state.inputInfo.vertex->mesh;
     std::uint32_t clipDistanceCount = 0u;
     std::uint32_t cullDistanceCount = 0u;
@@ -1036,6 +1190,12 @@ void EmitPixelEntryPoint(SpirvEmitterState& state) {
 }
 
 void EmitMeshEntryPoint(SpirvEmitterState& state) {
+#ifdef __APPLE__
+    if (state.meshEmulated) {
+        EmitEmulatedMeshEntryPoint(state);
+        return;
+    }
+#endif
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.module.AllocateId());
     for (std::uint32_t half = 0; half < state.laneCount; half++) {

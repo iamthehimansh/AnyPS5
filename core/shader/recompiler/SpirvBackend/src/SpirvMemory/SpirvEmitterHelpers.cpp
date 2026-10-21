@@ -136,7 +136,11 @@ std::uint32_t StorageBufferU64BlockType(SpirvEmitterState& state) {
 }
 
 std::uint32_t PushConstantArrayType(SpirvEmitterState& state) {
+#ifdef __APPLE__
+    const auto count = ConstantU32(state, state.meshEmulated ? MeshEmulationPushDwords : PushData::DwordCount);
+#else
     const auto count = ConstantU32(state, PushData::DwordCount);
+#endif
     return state.module.DecoratedType(spv::OpTypeArray,
         {{spv::OpDecorate, {spv::DecorationArrayStride, static_cast<std::uint32_t>(sizeof(std::uint32_t))}}},
         TypeU32(state), count);
@@ -201,6 +205,14 @@ void DefineInputs(SpirvEmitterState& state) {
     })) {
         state.inputs.push_back(SpirvInputBinding {{StageInputKind::LocalInvocationIndex, 0u, 1u, "gl_LocalInvocationIndex", false}});
     }
+#ifdef __APPLE__
+    // An emulated mesh stage places each workgroup's records by its workgroup id.
+    if (state.meshEmulated && std::none_of(state.inputs.begin(), state.inputs.end(), [](const SpirvInputBinding& input) {
+        return input.kind == StageInputKind::WorkgroupId;
+    })) {
+        state.inputs.push_back(SpirvInputBinding {{StageInputKind::WorkgroupId, 0u, 3u, "gl_WorkGroupID", false}});
+    }
+#endif
     if (LdsInDeviceMemory(state)) {
         if (std::none_of(state.inputs.begin(), state.inputs.end(), [](const SpirvInputBinding& input) {
             return input.kind == StageInputKind::WorkgroupId;

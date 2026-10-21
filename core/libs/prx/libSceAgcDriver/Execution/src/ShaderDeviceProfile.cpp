@@ -71,7 +71,11 @@ ShaderDeviceProfile::ShaderDeviceProfile(const ShaderRecompiler::SpirvTarget& ta
     checkFeature(spv::CapabilityDrawParameters, drawParameters != nullptr && drawParameters->shaderDrawParameters == VK_TRUE, "shaderDrawParameters");
     checkFeature(spv::CapabilityShaderClockKHR, clock != nullptr && clock->shaderSubgroupClock == VK_TRUE && clock->shaderDeviceClock == VK_TRUE, "shader clock");
     Require(!target.fragmentShaderBarycentricEnabled || barycentricEnabled, "shader device profile exposes disabled barycentrics");
+#ifdef __APPLE__
+    Require(!target.mesh || meshEnabled || target.meshEmulated, "shader device profile exposes disabled mesh shaders");
+#else
     Require(!target.mesh || meshEnabled, "shader device profile exposes disabled mesh shaders");
+#endif
     Require(!target.nonConstantImageOffsets || (maintenance8 != nullptr && maintenance8->maintenance8 == VK_TRUE), "shader device profile exposes disabled maintenance8");
     Require(!target.tessellation || core.tessellationShader == VK_TRUE, "shader device profile exposes disabled tessellation");
     for (const auto extension : target.supportedExtensions) extensions.emplace_back(extension);

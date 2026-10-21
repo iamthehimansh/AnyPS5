@@ -445,4 +445,85 @@ BarycentricTessellationShaders BuildBarycentricTessellationShaders(const Recompi
     return shaders;
 }
 
+#ifdef __APPLE__
+RecompileResult BuildMeshEmulationVertexShader(const RecompileResult& mesh, const SpirvTarget& target) {
+    require(target.spirvVersion >= 0x00010300u && target.spirvVersion <= 0x00010500u, "unsupported SPIR-V target version");
+    auto locations = mesh.parameterExports;
+    std::ranges::sort(locations);
+    SpirvModule builder(target.spirvVersion);
+    builder.EmitCapability(spv::CapabilityShader);
+    builder.EmitCapability(spv::CapabilityInt64);
+    builder.EmitCapability(spv::CapabilityPhysicalStorageBufferAddresses);
+    if (target.spirvVersion < 0x00010500u) builder.EmitExtension("SPV_KHR_physical_storage_buffer");
+    builder.AddMemoryModel(spv::AddressingModelPhysicalStorageBuffer64, spv::MemoryModelGLSL450);
+    const auto voidType = builder.Type(spv::OpTypeVoid);
+    const auto uintType = builder.Type(spv::OpTypeInt, 32u, 0u);
+    const auto u64Type = builder.Type(spv::OpTypeInt, 64u, 0u);
+    const auto floatType = builder.Type(spv::OpTypeFloat, 32u);
+    const auto vec4Type = builder.Type(spv::OpTypeVector, floatType, 4u);
+    const auto functionType = builder.Type(spv::OpTypeFunction, voidType);
+    const auto perVertexType = builder.DecoratedType(spv::OpTypeStruct, {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}}, {spv::OpDecorate, {spv::DecorationBlock}}}, vec4Type);
+    const auto pushWords = builder.DecoratedType(spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}}, uintType, builder.Constant(spv::OpConstant, uintType, 32u));
+    const auto pushType = builder.DecoratedType(spv::OpTypeStruct, {{spv::OpMemberDecorate, {0u, spv::DecorationOffset, 0u}}, {spv::OpDecorate, {spv::DecorationBlock}}}, pushWords);
+    std::vector<std::uint32_t> interfaces;
+    const auto variable = [&](spv::StorageClass storage, std::uint32_t type) {
+        const auto id = builder.DefineGlobalVariable(builder.Type(spv::OpTypePointer, storage, type), storage);
+        interfaces.push_back(id);
+        return id;
+    };
+    const auto perVertex = variable(spv::StorageClassOutput, perVertexType);
+    const auto push = variable(spv::StorageClassPushConstant, pushType);
+    const auto intType = builder.Type(spv::OpTypeInt, 32u, 1u);
+    const auto vertexIndex = variable(spv::StorageClassInput, intType);
+    builder.AddAnnotation(spv::OpDecorate, vertexIndex, spv::DecorationBuiltIn, spv::BuiltInVertexIndex);
+    std::vector<std::uint32_t> outputs;
+    for (const auto location : locations) {
+        outputs.push_back(variable(spv::StorageClassOutput, vec4Type));
+        builder.AddAnnotation(spv::OpDecorate, outputs.back(), spv::DecorationLocation, location);
+    }
+    const auto main = builder.AllocateId();
+    builder.AddFunction(spv::OpFunction, voidType, main, spv::FunctionControlMaskNone, functionType);
+    builder.EmitEntryPoint(spv::ExecutionModelVertex, main, "main", interfaces);
+    builder.AddFunction(spv::OpLabel, builder.AllocateId());
+    const auto value = [&](std::uint32_t opcode, std::uint32_t type, auto... operands) {
+        const auto id = builder.AllocateId();
+        builder.AddFunction(opcode, type, id, operands...);
+        return id;
+    };
+    const auto u32 = [&](std::uint32_t constant) { return builder.Constant(spv::OpConstant, uintType, constant); };
+    const auto u64 = [&](std::uint64_t constant) { return builder.Constant(spv::OpConstant, u64Type, static_cast<std::uint32_t>(constant), static_cast<std::uint32_t>(constant >> 32u)); };
+    const auto word = [&](std::uint32_t index) {
+        const auto loaded = value(spv::OpLoad, uintType, value(spv::OpAccessChain, builder.Type(spv::OpTypePointer, spv::StorageClassPushConstant, uintType), push, u32(0u), u32(index)));
+        return value(spv::OpUConvert, u64Type, loaded);
+    };
+    const auto address = [&](std::uint32_t member) {
+        return value(spv::OpBitwiseOr, u64Type, word(member * 2u), value(spv::OpShiftLeftLogical, u64Type, word(member * 2u + 1u), u32(32u)));
+    };
+    const auto offset = [&](std::uint32_t base, std::uint32_t element, std::uint32_t bytes) {
+        return value(spv::OpIAdd, u64Type, base, value(spv::OpIMul, u64Type, value(spv::OpUConvert, u64Type, element), u64(bytes)));
+    };
+    const auto recordBytes = static_cast<std::uint32_t>(locations.size() + 1u) * 16u;
+    const auto indexPointer = value(spv::OpConvertUToPtr, builder.Type(spv::OpTypePointer, spv::StorageClassPhysicalStorageBuffer, uintType), offset(address(1u), value(spv::OpBitcast, uintType, value(spv::OpLoad, intType, vertexIndex)), 4u));
+    const auto vertex = value(spv::OpLoad, uintType, indexPointer, spv::MemoryAccessAlignedMask, 4u);
+    const auto record = offset(address(0u), vertex, recordBytes);
+    const auto slot = [&](std::uint32_t index) {
+        const auto slotAddress = value(spv::OpIAdd, u64Type, record, u64(static_cast<std::uint64_t>(index) * 16u));
+        const auto pointer = value(spv::OpConvertUToPtr, builder.Type(spv::OpTypePointer, spv::StorageClassPhysicalStorageBuffer, vec4Type), slotAddress);
+        return value(spv::OpLoad, vec4Type, pointer, spv::MemoryAccessAlignedMask, 16u);
+    };
+    builder.AddFunction(spv::OpStore, value(spv::OpAccessChain, builder.Type(spv::OpTypePointer, spv::StorageClassOutput, vec4Type), perVertex, u32(0u)), slot(0u));
+    for (std::size_t i = 0; i < outputs.size(); ++i) builder.AddFunction(spv::OpStore, outputs[i], slot(static_cast<std::uint32_t>(i + 1u)));
+    builder.AddFunction(spv::OpReturn);
+    builder.AddFunction(spv::OpFunctionEnd);
+    RecompileResult result;
+    result.spirv = builder.Finalize();
+    result.parameterExports = std::move(locations);
+    result.pushConstants.assign(16u, std::byte{0});
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+    result.spirv = ValidateAndOptimizeSpirv(result.spirv, target.vulkanVersion, target.spirvVersion);
+#endif
+    return result;
+}
+
+#endif
 }

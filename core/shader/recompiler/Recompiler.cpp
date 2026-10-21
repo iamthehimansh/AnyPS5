@@ -597,8 +597,18 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.spannedWaves = request.target.spannedWaves;
     targetOptions.robustBufferAccess2 = request.target.robustBufferAccess2;
     targetOptions.float32FlushToZero = request.target.float32FlushToZero;
+#ifdef __APPLE__
+    targetOptions.meshEmulated = request.target.meshEmulated && request.shader.stage == ShaderStage::Mesh;
+#endif
+#ifdef __APPLE__
+    // An emulated mesh draw is drawn by a passthrough vertex shader, so its pixel shader takes barycentrics through
+    // the vertex-path fallback and the mesh program exports no barycentric layout.
+    targetOptions.meshBarycentricPixel = request.shader.stage == ShaderStage::Fragment && request.graphics && request.graphics->mesh && !request.target.meshEmulated;
+    if (request.shader.stage == ShaderStage::Mesh && request.graphics && request.graphics->meshBarycentrics && !request.target.meshEmulated) {
+#else
     targetOptions.meshBarycentricPixel = request.shader.stage == ShaderStage::Fragment && request.graphics && request.graphics->mesh;
     if (request.shader.stage == ShaderStage::Mesh && request.graphics && request.graphics->meshBarycentrics) {
+#endif
         const auto& paired = *request.graphics->meshBarycentrics;
         const auto emulated = DescribeEmulatedInterface(paired.parameters, paired.emulation, true);
         const auto& layout = emulated.layout;

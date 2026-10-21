@@ -3681,6 +3681,14 @@ ShaderRecompiler::SpirvTarget VulkanDevice::buildTarget() const {
         const auto& mesh = state->meshLimits;
         target.mesh = ShaderRecompiler::MeshTargetLimits{{mesh.maxMeshWorkGroupSize[0], mesh.maxMeshWorkGroupSize[1], mesh.maxMeshWorkGroupSize[2]}, mesh.maxMeshWorkGroupInvocations, std::min(mesh.maxMeshSharedMemorySize, mesh.maxMeshPayloadAndSharedMemorySize), mesh.maxMeshOutputVertices, mesh.maxMeshOutputPrimitives, mesh.maxMeshOutputComponents, std::min(mesh.maxMeshOutputMemorySize, mesh.maxMeshPayloadAndOutputMemorySize), mesh.meshOutputPerVertexGranularity, mesh.meshOutputPerPrimitiveGranularity};
     }
+#ifdef __APPLE__
+    // Without VK_EXT_mesh_shader (MoltenVK) the mesh stage runs as a compute shader that writes vertex records and
+    // triangle indices, drawn afterwards by a passthrough vertex shader; its limits are the compute limits.
+    else {
+        target.mesh = ShaderRecompiler::MeshTargetLimits{{limits.maxComputeWorkGroupSize[0], limits.maxComputeWorkGroupSize[1], limits.maxComputeWorkGroupSize[2]}, limits.maxComputeWorkGroupInvocations, limits.maxComputeSharedMemorySize, 256u, 256u, 128u, 32768u, 1u, 1u};
+        target.meshEmulated = true;
+    }
+#endif
     if (state->tessellationShader) target.tessellation = ShaderRecompiler::TessellationTargetLimits{limits.maxTessellationPatchSize, limits.maxTessellationControlPerVertexInputComponents, limits.maxTessellationControlPerVertexOutputComponents, limits.maxTessellationControlPerPatchOutputComponents, limits.maxTessellationControlTotalOutputComponents, limits.maxTessellationEvaluationInputComponents, limits.maxTessellationEvaluationOutputComponents};
     return target;
 }
@@ -3891,6 +3899,31 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     static const bool trace = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     if (trace) APS5_LOG_OUT("VulkanDevice::Draw indices=%u instances=%u indexSize=%u address=0x%llx shaders=%zu colorTarget=%u", draw.indexCount, draw.instanceCount, draw.indexSize, static_cast<unsigned long long>(draw.indexAddress), shaders.size(), static_cast<unsigned>(graphics.hasColorTarget));
     const auto context = graphicsContext();
+#ifdef __APPLE__
+    // Without VK_EXT_mesh_shader the mesh program was compiled as a compute shader that writes vertex records and
+    // triangle indices; a passthrough vertex shader draws them, and barycentrics take the vertex-path fallback.
+    if (!context.meshShader && !shaders.empty() && shaders.front().stage == ShaderRecompiler::ShaderStage::Mesh) {
+        using Stage = ShaderRecompiler::ShaderStage;
+        const auto& target = state->shaderProfile->Target();
+        require(target.meshEmulated && graphics.stages.mesh.has_value() && shaders.size() == 2, "a mesh draw without mesh shaders needs mesh emulation and exactly one pixel shader");
+        std::vector<ShaderRecompiler::RecompileResult> synthesized;
+        synthesized.reserve(3);
+        synthesized.push_back(ShaderRecompiler::BuildMeshEmulationVertexShader(*shaders[0].program, target));
+        std::vector<Graphics::CompiledShader> stages{{Stage::Compute, shaders[0].program, shaders[0].pushConstantOffset}, {Stage::Vertex, &synthesized[0], 0}};
+        if (shaders[1].program->barycentricEmulation.active) {
+            require(target.tessellation.has_value(), "an emulated mesh draw whose pixel shader reads barycentrics needs tessellation");
+            auto patches = ShaderRecompiler::BuildBarycentricTessellationShaders(synthesized[0], *shaders[1].program, target, MaxFragmentInputComponents());
+            synthesized.push_back(std::move(patches.control));
+            synthesized.push_back(std::move(patches.evaluation));
+            stages.push_back({Stage::TessellationControl, &synthesized[1], 0});
+            stages.push_back({Stage::TessellationEvaluation, &synthesized[2], 0});
+        }
+        stages.push_back(shaders[1]);
+        Graphics::Draw(context, graphics, draw, stages, snapshots, nullptr);
+        if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
+        return;
+    }
+#endif
     Graphics::Draw(context, graphics, draw, shaders, snapshots, recipe);
     if (trace) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }

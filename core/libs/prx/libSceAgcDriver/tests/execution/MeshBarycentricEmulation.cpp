@@ -278,6 +278,12 @@ int main() {
             std::puts("skipped, the device has no VK_EXT_mesh_shader");
             return VulkanTestSkipped;
         }
+#ifdef __APPLE__
+        if (device->Target().meshEmulated) {
+            std::puts("skipped, an emulated mesh device takes barycentrics from the vertex-path fallback");
+            return VulkanTestSkipped;
+        }
+#endif
         if (device->DeviceName().starts_with("llvmpipe")) {
             std::puts("skipped, the device has no mesh shader compiler that handles these programs (llvmpipe)");
             return VulkanTestSkipped;

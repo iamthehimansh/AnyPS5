@@ -298,6 +298,10 @@ function(add_shader_recompiler target runtimeTarget)
             LoadStamp
             WriteFileAtomically
     )
+    if(APPLE)
+        # Pure function of the mesh RecompileResult it is given, which is itself keyed.
+        list(APPEND shaderCacheReviewedNames BuildMeshEmulationVertexShader)
+    endif()
     set(shaderCacheManifest)
     foreach(section IN ITEMS sources guard submodules includes reviewed)
         if(section STREQUAL "sources")

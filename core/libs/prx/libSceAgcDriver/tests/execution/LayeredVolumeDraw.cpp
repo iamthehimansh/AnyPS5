@@ -292,6 +292,9 @@ int main(int argc, char** argv) {
         Run(*device, thickColor, false, PixelCode, false);
         Check(thickVolume.Data(), thickColor, "thick SW_4KB_S_X vertex draw and writeback", WhiteBands);
         if (vertexOnly) std::puts("layered volume vertex draw tests passed");
+#ifdef __APPLE__
+        else if (target.meshEmulated) std::puts("mesh case skipped, an emulated mesh stage carries no Layer output");
+#endif
         else if (target.mesh.has_value()) Run(*device, color, true, PixelCode, false);
         else std::puts("mesh case skipped, the device has no VK_EXT_mesh_shader");
         std::puts("layered volume draw tests passed");
