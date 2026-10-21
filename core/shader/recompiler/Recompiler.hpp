@@ -193,6 +193,7 @@ struct ShaderPixelStageInfo {
     bool iteratesSamples = false;
     PixelPositionLocation positionLocation = PixelPositionLocation::Center;
     std::array<std::uint8_t, 32> sampleLocations{};
+    std::array<std::uint32_t, 4> sampleOrder{};
 };
 
 struct ShaderVertexBufferResource {
@@ -796,7 +797,7 @@ struct BarycentricTessellationShaders {
     RecompileResult evaluation;
 };
 
-[[nodiscard]] BarycentricTessellationShaders BuildBarycentricTessellationShaders(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, std::uint32_t maxFragmentInputComponents);
+[[nodiscard]] BarycentricTessellationShaders BuildBarycentricTessellationShaders(const RecompileResult& vertex, const RecompileResult& fragment, const SpirvTarget& target, std::uint32_t maxFragmentInputComponents, std::uint32_t provokingVertex);
 
 #ifdef __APPLE__
 // The vertex half of a mesh stage emulated as compute: vertex input 0 is the position and inputs 1.. are the mesh
