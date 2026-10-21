@@ -293,6 +293,7 @@ struct SpirvTarget {
     bool robustBufferAccess2 = false;
     bool depthRangeRemap = false;
     bool float32FlushToZero = false;
+    bool waveLdsMemoryBarriers = false;
     bool float32DenormPreserve = false;
 #ifdef __APPLE__
     bool meshEmulated = false;
