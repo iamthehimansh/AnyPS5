@@ -2212,9 +2212,9 @@ void DrawEmulatedMesh(const Context& context, const State& state, const Pm4::Dra
     }
     if (groupCount == 0 || instances == 0) return;
     const std::uint64_t totalGroups = static_cast<std::uint64_t>(groupCount) * instances;
-    const auto recordBytes = static_cast<std::uint64_t>(shaders[1].program->parameterExports.size() + 1u) * 16u;
+    const auto recordBytes = static_cast<std::uint64_t>(shaders[1].program->parameterExports.size() + (mesh.outputPrimitiveSize == 1u ? 2u : 1u)) * 16u;
     const auto vertices = totalGroups * mesh.maxVertices;
-    Require(mesh.outputPrimitiveSize == 2u || mesh.outputPrimitiveSize == 3u, "an emulated mesh draw writes lines or triangles");
+    Require(mesh.outputPrimitiveSize >= 1u && mesh.outputPrimitiveSize <= 3u, "an emulated mesh draw writes points, lines or triangles");
     const std::uint64_t corners = mesh.outputPrimitiveSize;
     const auto triangles = totalGroups * mesh.maxPrimitives;
     Require(triangles * corners <= std::numeric_limits<std::uint32_t>::max(), "an emulated mesh draw writes too many primitives");
@@ -2293,7 +2293,8 @@ void DrawEmulatedMesh(const Context& context, const State& state, const Pm4::Dra
     State flat = state;
     flat.stages.mesh.reset();
     flat.stages.path = ShaderPath::Vertex;
-    flat.topology = corners == 2u ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    flat.topology = corners == 1u ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST : corners == 2u ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    flat.vertexPoints = corners == 1u;
     flat.primitiveRestart = false;
     Pm4::DrawParameters list = draw;
     list.indexed = false;

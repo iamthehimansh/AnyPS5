@@ -806,8 +806,9 @@ struct BarycentricTessellationShaders {
 
 #ifdef __APPLE__
 // The vertex half of a mesh stage emulated as compute: vertex input 0 is the position and inputs 1.. are the mesh
-// program's parameter exports in ascending location order, one vec4 each, as the compute half writes its records.
-[[nodiscard]] RecompileResult BuildMeshEmulationVertexShader(const RecompileResult& mesh, const SpirvTarget& target);
+// program's parameter exports in ascending location order, one vec4 each, as the compute half writes its records;
+// for points a last vec4 carries the point size in .x.
+[[nodiscard]] RecompileResult BuildMeshEmulationVertexShader(const RecompileResult& mesh, const SpirvTarget& target, bool points);
 
 #endif
 }

@@ -447,7 +447,7 @@ BarycentricTessellationShaders BuildBarycentricTessellationShaders(const Recompi
 }
 
 #ifdef __APPLE__
-RecompileResult BuildMeshEmulationVertexShader(const RecompileResult& mesh, const SpirvTarget& target) {
+RecompileResult BuildMeshEmulationVertexShader(const RecompileResult& mesh, const SpirvTarget& target, bool points) {
     require(target.spirvVersion >= 0x00010300u && target.spirvVersion <= 0x00010500u, "unsupported SPIR-V target version");
     auto locations = mesh.parameterExports;
     std::ranges::sort(locations);
@@ -463,7 +463,8 @@ RecompileResult BuildMeshEmulationVertexShader(const RecompileResult& mesh, cons
     const auto floatType = builder.Type(spv::OpTypeFloat, 32u);
     const auto vec4Type = builder.Type(spv::OpTypeVector, floatType, 4u);
     const auto functionType = builder.Type(spv::OpTypeFunction, voidType);
-    const auto perVertexType = builder.DecoratedType(spv::OpTypeStruct, {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}}, {spv::OpDecorate, {spv::DecorationBlock}}}, vec4Type);
+    const auto perVertexType = points ? builder.DecoratedType(spv::OpTypeStruct, {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}}, {spv::OpMemberDecorate, {1u, spv::DecorationBuiltIn, spv::BuiltInPointSize}}, {spv::OpDecorate, {spv::DecorationBlock}}}, vec4Type, floatType)
+                                      : builder.DecoratedType(spv::OpTypeStruct, {{spv::OpMemberDecorate, {0u, spv::DecorationBuiltIn, spv::BuiltInPosition}}, {spv::OpDecorate, {spv::DecorationBlock}}}, vec4Type);
     const auto pushWords = builder.DecoratedType(spv::OpTypeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}}, uintType, builder.Constant(spv::OpConstant, uintType, 32u));
     const auto pushType = builder.DecoratedType(spv::OpTypeStruct, {{spv::OpMemberDecorate, {0u, spv::DecorationOffset, 0u}}, {spv::OpDecorate, {spv::DecorationBlock}}}, pushWords);
     std::vector<std::uint32_t> interfaces;
@@ -503,7 +504,7 @@ RecompileResult BuildMeshEmulationVertexShader(const RecompileResult& mesh, cons
     const auto offset = [&](std::uint32_t base, std::uint32_t element, std::uint32_t bytes) {
         return value(spv::OpIAdd, u64Type, base, value(spv::OpIMul, u64Type, value(spv::OpUConvert, u64Type, element), u64(bytes)));
     };
-    const auto recordBytes = static_cast<std::uint32_t>(locations.size() + 1u) * 16u;
+    const auto recordBytes = static_cast<std::uint32_t>(locations.size() + (points ? 2u : 1u)) * 16u;
     const auto indexPointer = value(spv::OpConvertUToPtr, builder.Type(spv::OpTypePointer, spv::StorageClassPhysicalStorageBuffer, uintType), offset(address(1u), value(spv::OpBitcast, uintType, value(spv::OpLoad, intType, vertexIndex)), 4u));
     const auto vertex = value(spv::OpLoad, uintType, indexPointer, spv::MemoryAccessAlignedMask, 4u);
     const auto record = offset(address(0u), vertex, recordBytes);
@@ -514,6 +515,10 @@ RecompileResult BuildMeshEmulationVertexShader(const RecompileResult& mesh, cons
     };
     builder.AddFunction(spv::OpStore, value(spv::OpAccessChain, builder.Type(spv::OpTypePointer, spv::StorageClassOutput, vec4Type), perVertex, u32(0u)), slot(0u));
     for (std::size_t i = 0; i < outputs.size(); ++i) builder.AddFunction(spv::OpStore, outputs[i], slot(static_cast<std::uint32_t>(i + 1u)));
+    if (points) {
+        const auto size = value(spv::OpCompositeExtract, floatType, slot(static_cast<std::uint32_t>(locations.size() + 1u)), 0u);
+        builder.AddFunction(spv::OpStore, value(spv::OpAccessChain, builder.Type(spv::OpTypePointer, spv::StorageClassOutput, floatType), perVertex, u32(1u)), size);
+    }
     builder.AddFunction(spv::OpReturn);
     builder.AddFunction(spv::OpFunctionEnd);
     RecompileResult result;

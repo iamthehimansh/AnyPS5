@@ -973,12 +973,12 @@ static void DefineEmulatedMeshOutputs(SpirvEmitterState& state) {
     if (state.meshBarycentricVertex) {
         throw std::runtime_error("an emulated mesh stage takes barycentrics from the vertex-path fallback, not from mesh outputs");
     }
-    if (mesh.outputPrimitiveSize != 2u && mesh.outputPrimitiveSize != 3u) {
-        throw std::runtime_error("an emulated mesh stage only writes lines and triangles");
+    if (mesh.outputPrimitiveSize < 1u || mesh.outputPrimitiveSize > 3u) {
+        throw std::runtime_error("an emulated mesh stage only writes points, lines and triangles");
     }
     for (auto& output : state.outputs) {
-        if (output.kind != StageOutputKind::Position && output.kind != StageOutputKind::Parameter) {
-            throw std::runtime_error("an emulated mesh stage only carries the position and parameters");
+        if (output.kind != StageOutputKind::Position && output.kind != StageOutputKind::Parameter && !(output.kind == StageOutputKind::PointSize && mesh.outputPrimitiveSize == 1u)) {
+            throw std::runtime_error("an emulated mesh stage only carries the position, parameters and a point size");
         }
         output.meshDataVariable = MeshArray(state, spv::StorageClassPrivate, MeshOutputType(state, output.kind), state.laneCount);
     }
@@ -990,8 +990,8 @@ static void DefineEmulatedMeshOutputs(SpirvEmitterState& state) {
     }
 }
 
-// The position, then every parameter in ascending location order, one vec4 each; the driver lays the passthrough
-// vertex shader's attributes out the same way from the result's parameterExports.
+// The position, then every parameter in ascending location order, then for points the point size in .x, one vec4
+// each; the driver and the passthrough vertex shader lay the record out the same way.
 static std::vector<const SpirvOutputBinding*> EmulatedMeshRecord(const SpirvEmitterState& state) {
     // A program that never exports a position keeps the slot; its vertices are written at the origin.
     std::vector<const SpirvOutputBinding*> record{nullptr};
@@ -1004,14 +1004,28 @@ static std::vector<const SpirvOutputBinding*> EmulatedMeshRecord(const SpirvEmit
     }
     std::ranges::sort(parameters, {}, [](const SpirvOutputBinding* output) { return output->location; });
     record.insert(record.end(), parameters.begin(), parameters.end());
+    if (state.inputInfo.vertex->mesh.outputPrimitiveSize == 1u) {
+        const auto size = std::ranges::find(state.outputs, StageOutputKind::PointSize, &SpirvOutputBinding::kind);
+        record.push_back(size != state.outputs.end() ? &*size : nullptr);
+    }
     return record;
 }
 
 static void EmitEmulatedMeshEntryPoint(SpirvEmitterState& state) {
     state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.mainFunc, spv::FunctionControlMaskNone, TypeFunction(state));
     EmitLabel(state, state.module.AllocateId());
+    const bool points = state.inputInfo.vertex->mesh.outputPrimitiveSize == 1u && state.inputInfo.vertex->pointList;
     for (std::uint32_t half = 0; half < state.laneCount; half++) {
         state.module.AddFunction(spv::OpStore, MeshElement(state, state.meshPrimitiveData, spv::StorageClassPrivate, TypeU32(state), ConstantU32(state, half)), ConstantU32(state, 0x80000000u));
+        if (points) {
+            const auto& vertex = *state.inputInfo.vertex;
+            const bool fromVertex = (vertex.paClVsOutCntl & (1u << 16u)) != 0u;
+            if (!fromVertex && !(vertex.pointSize > 0.0f)) FailEmit("mesh points need a positive PA_SU_POINT_SIZE");
+            if (fromVertex && !(vertex.pointSizeMax > 0.0f)) FailEmit("mesh point sizes need a positive PA_SU_POINT_MINMAX maximum");
+            const auto size = fromVertex ? std::clamp(vertex.pointSize, PointSizeFloor(vertex), vertex.pointSizeMax) : vertex.pointSize;
+            state.laneHalf = half;
+            state.module.AddFunction(spv::OpStore, MeshOutputPointer(state, StageOutputKind::PointSize), ConstantF32(state, std::bit_cast<std::uint32_t>(size)));
+        }
     }
     const auto firstInvocation = state.module.AllocateId();
     state.laneHalf = 0;
@@ -1084,7 +1098,15 @@ static void EmitEmulatedMeshEntryPoint(SpirvEmitterState& state) {
         EmitIfCondition(state, isVertex, [&]() {
             const auto vertex = EmitBinaryU32(state, spv::OpIAdd, firstVertex, index);
             for (std::uint32_t slot = 0; slot < record.size(); slot++) {
-                const auto value = record[slot] != nullptr ? MeshLoad(state, record[slot]->meshDataVariable, spv::StorageClassPrivate, TypeF32Vector(state, 4u), ConstantU32(state, half)) : state.module.Constant(spv::OpConstantNull, TypeF32Vector(state, 4u));
+                auto value = state.module.Constant(spv::OpConstantNull, TypeF32Vector(state, 4u));
+                if (record[slot] != nullptr && record[slot]->kind == StageOutputKind::PointSize) {
+                    const auto size = MeshLoad(state, record[slot]->meshDataVariable, spv::StorageClassPrivate, TypeF32(state), ConstantU32(state, half));
+                    const auto zero = ConstantF32(state, 0u);
+                    value = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4u), value, size, zero, zero, zero);
+                } else if (record[slot] != nullptr) {
+                    value = MeshLoad(state, record[slot]->meshDataVariable, spv::StorageClassPrivate, TypeF32Vector(state, 4u), ConstantU32(state, half));
+                }
                 store(vec4Pointer, at(vertexAddress, vertex, recordBytes, slot * 16u), value, 16u);
             }
         });

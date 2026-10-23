@@ -3984,7 +3984,7 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
         require(target.meshEmulated && graphics.stages.mesh.has_value() && shaders.size() == 2, "a mesh draw without mesh shaders needs mesh emulation and exactly one pixel shader");
         std::vector<ShaderRecompiler::RecompileResult> synthesized;
         synthesized.reserve(3);
-        synthesized.push_back(ShaderRecompiler::BuildMeshEmulationVertexShader(*shaders[0].program, target));
+        synthesized.push_back(ShaderRecompiler::BuildMeshEmulationVertexShader(*shaders[0].program, target, graphics.stages.mesh->outputPrimitiveSize == 1u));
         std::vector<Graphics::CompiledShader> stages{{Stage::Compute, shaders[0].program, shaders[0].pushConstantOffset}, {Stage::Vertex, &synthesized[0], 0}};
         if (shaders[1].program->barycentricEmulation.active) {
             require(target.tessellation.has_value(), "an emulated mesh draw whose pixel shader reads barycentrics needs tessellation");
