@@ -301,6 +301,8 @@ private:
         append(key, value.waveLdsMemoryBarriers);
         append(key, value.float32DenormPreserve);
         append(key, value.fusedExactArithmetic);
+        append(key, value.largePixelFunctionLdsBuffer);
+        append(key, value.pixelFunctionStorageDwords);
 #ifdef __APPLE__
         append(key, value.meshEmulated);
 #endif
