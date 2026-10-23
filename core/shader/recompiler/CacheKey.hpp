@@ -300,6 +300,7 @@ private:
         append(key, value.float32FlushToZero);
         append(key, value.waveLdsMemoryBarriers);
         append(key, value.float32DenormPreserve);
+        append(key, value.fusedExactArithmetic);
 #ifdef __APPLE__
         append(key, value.meshEmulated);
 #endif

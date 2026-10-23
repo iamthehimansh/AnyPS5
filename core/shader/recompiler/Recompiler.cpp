@@ -605,6 +605,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.robustBufferAccess2 = request.target.robustBufferAccess2;
     targetOptions.float32FlushToZero = request.target.float32FlushToZero;
     targetOptions.float32DenormPreserve = request.target.float32DenormPreserve;
+    targetOptions.fusedExactArithmetic = request.target.fusedExactArithmetic;
 #ifdef __APPLE__
     targetOptions.meshEmulated = request.target.meshEmulated && request.shader.stage == ShaderStage::Mesh;
 #endif
